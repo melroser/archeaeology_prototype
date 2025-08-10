@@ -40,14 +40,32 @@ def identify_track_acoustid(filepath: Path, acoustid_key: Optional[str]) -> Tupl
     return ("Unknown Artist", filepath.stem)
 
 
-def separate_stems_demucs(source_path: Path, out_dir: Path) -> Optional[Path]:
+def separate_stems_demucs(source_path: Path, stems_dir: Path) -> Optional[Path]:
     """Call demucs CLI to separate stems. Returns path to separation folder or None."""
     try:
         LOG.info("Running demucs (this may take a while)...")
-        cmd = ["demucs", "-n", "htdemucs", "-o", str(out_dir), str(source_path)]
+        cmd = ["demucs", "-n", "htdemucs", "-o", str(stems_dir), str(source_path)]
         subprocess.run(cmd, check=True)
         LOG.info("Demucs finished.")
-        return out_dir
+        # Move separated stems from out_dir/htdemucs/<track> into out_dir/<artist> - <title>/stems
+        # Extract artist and title from source_path or use Unknown Artist/Unknown Title if not available
+        artist, title = identify_track_acoustid(source_path, None)
+        track_name = source_path.stem
+        src_dir = stems_dir / "htdemucs" / track_name
+        if src_dir.exists() and src_dir.is_dir():
+            stems_dir.mkdir(parents=True, exist_ok=True)
+            for stem_file in src_dir.glob("*.wav"):
+                dest_file = stems_dir / stem_file.name
+                shutil.move(str(stem_file), str(dest_file))
+            # Remove the now empty src_dir and htdemucs folder if empty
+            try:
+                src_dir.rmdir()
+                (stems_dir / "htdemucs").rmdir()
+            except Exception:
+                pass
+            return stems_dir
+        else:
+            return stems_dir
     except FileNotFoundError:
         LOG.warning("Demucs not found; skipping separation. Install demucs or set --skip-separate to true.")
     except subprocess.CalledProcessError as e:
@@ -139,7 +157,19 @@ def analyze_and_score(source_path: Path, stems_dir: Optional[Path], transcriptio
                 d = max(0.12, min(1.2, step))
                 candidates.append({"start": st, "dur": d, "type":"vocal-word", "label": w, "score": 0.0})
 
-    onset_frames = librosa.onset.onset_detect(y=y, sr=sr)
+    # Use drums stem for percussion detection if available
+    y_perc = None
+    if stems_dir:
+        drums_path = None
+        for p in Path(stems_dir).glob("drums.wav"):
+            drums_path = p
+            break
+        if drums_path and drums_path.exists():
+            y_perc, _ = librosa.load(str(drums_path), sr=22050, mono=True)
+    if y_perc is None:
+        y_perc = y
+
+    onset_frames = librosa.onset.onset_detect(y=y_perc, sr=sr)
     onset_times = librosa.frames_to_time(onset_frames, sr=sr)
     for t in onset_times:
         candidates.append({"start": float(t), "dur": 0.25, "type":"perc-hit", "label":"", "score":0.0})
@@ -147,7 +177,6 @@ def analyze_and_score(source_path: Path, stems_dir: Optional[Path], transcriptio
     hop = 512
     rms = librosa.feature.rms(y=y, hop_length=hop)[0]
     times = librosa.frames_to_time(range(len(rms)), sr=sr, hop_length=hop)
-    import numpy as np
     thresh = np.median(rms) * 1.2
     peaks = np.where(rms > thresh)[0]
     if peaks.size > 0:
@@ -160,12 +189,24 @@ def analyze_and_score(source_path: Path, stems_dir: Optional[Path], transcriptio
                 start = p
             prev = p
         groups.append((start, prev))
+
+        # Use bass, other, or vocals stems for drone detection if available
+        y_drone = None
+        if stems_dir:
+            for stem_name in ["bass.wav", "other.wav", "vocals.wav"]:
+                stem_path = stems_dir / stem_name
+                if stem_path.exists():
+                    y_drone, _ = librosa.load(str(stem_path), sr=22050, mono=True)
+                    break
+        if y_drone is None:
+            y_drone = y
+
         for a,b in groups:
             s = float(times[a])
             e = float(times[b])
-            dur = min(8.0, e - s)
-            if dur >= 0.5:
-                candidates.append({"start": s, "dur": dur, "type":"drone","label":"", "score":0.0})
+            dur = e - s
+            if dur >= 4.0:
+                candidates.append({"start": s, "dur": min(8.0, dur), "type":"drone","label":"", "score":0.0})
 
     S = librosa.onset.onset_strength(y=y, sr=sr)
     S_times = librosa.frames_to_time(range(len(S)), sr=sr)
@@ -205,11 +246,10 @@ def analyze_and_score(source_path: Path, stems_dir: Optional[Path], transcriptio
     return selected
 
 
-def write_chops_and_metadata(source_path: Path, artist: str, title: str, selected: List[Dict], out_base: Path, stems_dir: Optional[Path]):
+def write_chops_and_metadata(source_path: Path, selected: List[Dict], project_dir: Path):
     import soundfile as sf
     import librosa
-    out_base.mkdir(parents=True, exist_ok=True)
-    project_dir = out_base / f"{artist} - {title}"
+
     project_dir.mkdir(exist_ok=True)
     src_folder = project_dir / "source"
     src_folder.mkdir(exist_ok=True)
@@ -220,6 +260,7 @@ def write_chops_and_metadata(source_path: Path, artist: str, title: str, selecte
     chops_folder = project_dir / "chops"
     chops_folder.mkdir(exist_ok=True)
 
+    stems_dir = project_dir / "stems"
     vocal_path = None
     if stems_dir:
         for p in Path(stems_dir).rglob("*vocals*.wav"):
@@ -246,7 +287,8 @@ def write_chops_and_metadata(source_path: Path, artist: str, title: str, selecte
         fname = f"{s:.3f}-{d:.3f}-{c['type']}"
         if lab:
             fname += f"-{lab}"
-        fname += ".wav"
+        score_rounded = round(c.get("score", 0.0), 3)
+        fname += f"-{score_rounded:.3f}.wav"
         out_path = chops_folder / fname
         sf.write(str(out_path), chunk, sr)
         rows.append({"start": s, "dur": d, "type": c["type"], "label": c.get("label",""), "score": c.get("score",0.0), "file": str(out_path.relative_to(project_dir))})
@@ -267,13 +309,18 @@ def run_pipeline(source: Path, out_base: Path, acoustid_key: Optional[str], skip
         LOG.error(f"Source file not found: {source}")
         return
     artist, title = identify_track_acoustid(source, acoustid_key)
-    stems_dir = None
+    
+        
+    out_base.mkdir(parents=True, exist_ok=True)
+    project_dir = out_base / f"{artist} - {title}"
+    project_dir.mkdir(exist_ok=True)
+    
     if not skip_sep:
-        stems_dir = separate_stems_demucs(source, out_base / "stems")
+        stems_dir = separate_stems_demucs(source, project_dir / "stems")
         LOG.info(f"Separation completed stems at: {stems_dir}")
     transcription = transcribe_whisperx(source, model_name=whisper_model)
     LOG.info(f"Transcription completed result: {transcription}")
     selected = analyze_and_score(source, stems_dir, transcription, topk=topk)
     LOG.info(f"Analysis completed selected: {selected}")
-    project_dir = write_chops_and_metadata(source, artist, title, selected, out_base, stems_dir)
-    LOG.info(f"Pipeline complete. Project at: {project_dir}")
+    write_dir = write_chops_and_metadata(source, selected, project_dir)
+    LOG.info(f"Pipeline complete. Project at: {write_dir}")

@@ -2,3 +2,8 @@ __pycache__/
 output/
 venv/
 *.pyc
+*.DS_Store
+backend/archaeologist/.gitignore
+.vscode
+frontend/package-lock.json
+song.flac
