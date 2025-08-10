@@ -1,0 +1,13 @@
+numpy
+librosa
+soundfile
+tqdm
+requests
+pydantic
+fastapi
+uvicorn
+python-multipart
+# Optional for better separation/transcription:
+# demucs
+# openai-whisper
+# whisperx
