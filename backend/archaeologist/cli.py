@@ -26,18 +26,32 @@ def main(argv=None):
     parser.add_argument("--skip-separate", action="store_true", help="Skip stem separation (useful for debugging)")
     parser.add_argument("--topk", type=int, default=12, help="Number of curated chops to produce (producer mode)")
     parser.add_argument("--whisper-model", type=str, default="small", help="Whisper model (small/medium/large)")
+    parser.add_argument("--keywords", type=str, default="", help="Comma-separated keywords to boost (e.g. wake up, suicide)")
+    parser.add_argument("--mode", type=str, choices=["producer","nerd"], default="producer", help="Producer=curated few, Nerd=more candidates")
     parser.add_argument("-v", "--verbose", action="count", default=0)
     args = parser.parse_args(argv)
 
     setup_logging(args.verbose)
     LOG.info("Starting Archaeologist pipeline...")
+    # Back/forward-compatible call (works with or without new params)
+    from inspect import signature
 
-    run_pipeline(source=args.source.resolve(),
-                 out_base=args.out.resolve(),
-                 acoustid_key=args.acoustid_key,
-                 skip_sep=args.skip_separate,
-                 topk=args.topk,
-                 whisper_model=args.whisper_model)
+    kwargs = dict(
+        source=args.source.resolve(),
+        out_base=args.out.resolve(),
+        acoustid_key=args.acoustid_key,
+        skip_sep=args.skip_separate,
+        topk=args.topk,
+        whisper_model=args.whisper_model,
+    )
+
+    sig = signature(run_pipeline)
+    if "keywords" in sig.parameters:
+        kwargs["keywords"] = []
+    if "mode" in sig.parameters:
+        kwargs["mode"] = "producer"
+
+    run_pipeline(**kwargs)
 
 if __name__ == '__main__':
     main()

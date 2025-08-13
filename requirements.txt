@@ -1,3 +1,6 @@
+
+
+
 numpy
 librosa
 soundfile
@@ -7,7 +10,10 @@ pydantic
 fastapi
 uvicorn
 python-multipart
-# Optional for better separation/transcription:
-# demucs
-# openai-whisper
-# whisperx
+# Optional but recommended locally for full pipeline:
+torch            # install appropriate wheel for your platform
+demucs
+openai-whisper
+whisperx
+faster-whisper   # optional speed alternative backend
+
