@@ -31,7 +31,10 @@ def main(argv=None):
         prog="archaeologist",
         description="Archaeologist CLI — create curated chops from a track",
     )
-    parser.add_argument("source", type=Path, help="Source audio file")
+    parser.add_argument(
+            "source", 
+            type=Path, 
+            help="Source audio file")
     parser.add_argument(
         "--out",
         "-o",
@@ -82,7 +85,12 @@ def main(argv=None):
         default="producer",
         help="Producer=curated few, Nerd=more candidates",
     )
-    parser.add_argument("-v", "--verbose", action="count", default=0)
+    parser.add_argument(
+            "--verbose",
+            "-v",
+            action="count",
+            default=0
+    )
     args = parser.parse_args(argv)
 
     setup_logging(args.verbose)
