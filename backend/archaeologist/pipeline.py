@@ -1,5 +1,7 @@
 """
-Core pipeline for Archaeologist prototype.
+
+    Core pipeline for Archaeologist prototype.
+
 """
 import logging
 import subprocess
@@ -9,7 +11,89 @@ from typing import Optional, List, Tuple, Dict
 import shutil
 import csv
 
+from abc import ABC, abstractmethod
+import numpy as np
+
 LOG = logging.getLogger("archaeologist.pipeline")
+
+class ScoringStrategy(ABC):
+    @abstractmethod
+    def score(self, c, novelty_func):
+        pass
+
+class VocalPriorityStrategy(ScoringStrategy):
+    def score(self, c, novelty_func):
+        LOG.debug("Using Strategy: Vocal")
+        novelty = novelty_func(c["start"])
+        score = novelty * (c["dur"] ** 0.5)
+        if c["type"].startswith("vocal"):
+            score *= 1.6
+            if len(c.get("label","")) > 6:
+                score *= 1.2
+        return score
+
+
+class EnergyDominantStrategy(ScoringStrategy):
+    def score(self, c, novelty_func):
+        LOG.debug("Using Strategy: Energy")
+        novelty = novelty_func(c["start"])        # Energy weighting via RMS proxy: novelty acts as proxy but could use RMS array directly
+        return novelty * (c["dur"] ** 0.7)
+
+
+class LyricalImportanceStrategy(ScoringStrategy):
+    def score(self, c, novelty_func):
+        LOG.debug("Using Strategy: Lyrical")
+        novelty = novelty_func(c["start"])
+        score = novelty
+        if c["type"].startswith("vocal"):
+            label = c.get("label","").lower()
+            important_words = {"love", "hate", "die", "fire", "forever", "never", "always", "suicide"}
+            if any(word in label for word in important_words):
+                score *= 2.0
+        return score
+
+class PercussionDrivenStrategy(ScoringStrategy):
+    def score(self, c, novelty_func):
+        LOG.debug("Using Strategy: Perc")
+        if "perc" in c["type"]:
+            novelty = novelty_func(c["start"])
+            return novelty * 2.0
+        return 0.5 * novelty_func(c["start"])
+
+class BalancedDiversityStrategy(ScoringStrategy):
+    def __init__(self):
+        self.type_counts = {}
+    def score(self, c, novelty_func):
+        LOG.debug("Using Strategy: Bal")
+        novelty = novelty_func(c["start"])
+        type_count = self.type_counts.get(c["type"], 0)
+        # Penalize repetition of same type
+        penalty = 1.0 / (1 + type_count)
+        self.type_counts[c["type"]] = type_count + 1
+        return novelty * penalty
+
+class HybridScoringStrategy(ScoringStrategy):
+    def __init__(self, strategies_with_weights):
+        """
+        strategies_with_weights: list of (strategy_instance, weight)
+        Example:
+            [
+                (VocalPriorityStrategy(), 0.6),
+                (EnergyDominantStrategy(), 0.4)
+            ]
+        """
+        self.strategies_with_weights = strategies_with_weights
+
+    def score(self, c, novelty_func):
+        LOG.debug("Using Strategy: Hybrid")
+        total_score = 0.0
+        total_weight = 0.0
+        for strat, weight in self.strategies_with_weights:
+            s = strat.score(c, novelty_func)
+            total_score += s * weight
+            total_weight += weight
+        return total_score / total_weight if total_weight > 0 else 0.0
+
 
 def save_analysis_and_transcript(project_dir: Path,
                                  source_path: Path,
@@ -193,12 +277,14 @@ def _get_device_and_compute_type():
     try:
         import torch
         if torch.backends.mps.is_available():
-            return "mps", "float32"    # Apple Silicon
+            return "mps", "float16"    # Apple Silicon
         if torch.cuda.is_available():
             return "cuda", "float16"   # NVIDIA: fp16 ok
     except Exception:
         pass
-    return "cpu", "float32"
+    return "cpu", "float16"
+
+
 def transcribe_whisperx(source_path: Path, model_name: str = "small") -> Dict:
     """
     Transcribe with WhisperX and perform forced alignment for word-level timestamps.
@@ -208,14 +294,14 @@ def transcribe_whisperx(source_path: Path, model_name: str = "small") -> Dict:
     try:
         import whisperx
         device = "cpu"
-        compute_type = "float32"
+        compute_type = "float16"
 
         # simple, robust device choice
         try:
             import torch
             if torch.backends.mps.is_available():
                 device = "mps"
-                compute_type = "float32"
+                compute_type = "float16"
             elif torch.cuda.is_available():
                 device = "cuda"
                 compute_type = "float16"  # ok on NVIDIA
@@ -264,13 +350,15 @@ def transcribe_whisperx(source_path: Path, model_name: str = "small") -> Dict:
             LOG.error(f"No transcription model available. Install whisperx or whisper. {e2}")
             return {"text": "", "segments": []}
 
-
 def analyze_and_score(source_path: Path,
                       stems_dir: Optional[Path],
                       transcription: dict,
                       topk: int = 12,
+                      strategy: ScoringStrategy = VocalPriorityStrategy(),
                       keywords: Optional[List[str]] = None,
                       mode: str = "producer") -> List[Dict]:
+
+
     try:
         import librosa, numpy as np
     except Exception:
@@ -300,6 +388,7 @@ def analyze_and_score(source_path: Path,
                 st = s + i*step
                 d = max(0.12, min(1.2, step))
                 candidates.append({"start": st, "dur": d, "type":"vocal-word", "label": w, "score": 0.0})
+
 
     # percussion using drums stem if present
     import librosa
@@ -354,27 +443,28 @@ def analyze_and_score(source_path: Path,
     # novelty curve for scoring
     S = librosa.onset.onset_strength(y=y, sr=sr)
     S_times = librosa.frames_to_time(range(len(S)), sr=sr)
+
     def novelty_at(t):
         idx = np.argmin(np.abs(S_times - t))
         return float(S[idx]) if 0 <= idx < len(S) else 0.0
 
     for c in candidates:
-        start = c["start"]
-        dur = c["dur"]
-        novelty = float(novelty_at(start))
-        score = novelty * (dur ** 0.5)
+        c["score"] = float(strategy.score(c, novelty_at))
+        #start = c["start"]
+        #dur = c["dur"]
+        #novelty = novelty_at(start)
+        #score = novelty * (dur ** 0.5)
 
-        if c["type"].startswith("vocal"):
-            score *= 1.7
-            label = (c.get("label","") or "").lower()
-            # keyword boost
-            if kw and any(k in label for k in kw):
-                score *= 1.5
-            # prefer non-stopwords-ish tokens
-            if len(label) > 3:
-                score *= 1.15
+        #if c["type"].startswith("vocal"):
+        #    score *= 1.7
+        #    label = (c.get("label","") or "").lower()
+        #    # keyword boost
+        #    if kw and any(k in label for k in kw):
+        #        score *= 1.5
+        #    # prefer non-stopwords-ish tokens
+        #    if len(label) > 3:
+        #        score *= 1.15
 
-        c["score"] = float(score)
 
     candidates_sorted = sorted(candidates, key=lambda x: (-x["score"], x["start"]))
     selected = []
@@ -461,13 +551,17 @@ def run_pipeline(
     acoustid_key: Optional[str],
     skip_sep: bool,
     topk: int,
+    strat: str,
     whisper_model: str
 ):
     if not source.exists():
         LOG.error(f"Source file not found: {source}")
         return
 
+    LOG.info(f"Starting Track ID using {acoustid_key} as key")
+
     artist, title = identify_track_acoustid(source, acoustid_key)
+    LOG.info(f"Results Acoustid -  Artist: {artist} Title: {title}")
 
     out_base.mkdir(parents=True, exist_ok=True)
     project_dir = out_base / f"{artist} - {title}"
@@ -481,13 +575,62 @@ def run_pipeline(
 
     transcription = transcribe_whisperx(source, model_name=whisper_model)
     LOG.info("Transcription complete: %d segments", len(transcription.get("segments", [])))
+    # Create your strategies
+    selected_strategy = VocalPriorityStrategy()
+    LOG.info(f"selecstrategy: {selected_strategy}")
 
-    selected = analyze_and_score(source, stems_dir, transcription, topk=topk)
-    write_dir = write_chops_and_metadata(source, selected, project_dir)
+    match strat:
+        case "lyric":
+            selected_strategy = LyricalImportanceStrategy()
+        case "perc":
+            selected_strategy = PercussionDrivenStrategy()
+        case "balance":
+            selected_strategy = BalancedDiversityStrategy()
+        case "energy":
+            selected_strategy = EnergyDominantStrategy()
+        case "hybrid":
+            vocal_priority = VocalPriorityStrategy()
+            perc_driven = PercussionDrivenStrategy()
+            # Blend them with weights
+            selected_strategy = HybridScoringStrategy([
+                (vocal_priority, 0.6),
+                (perc_driven, 0.4)
+            ])
+
+    scored = analyze_and_score(
+            source,
+            stems_dir,
+            transcription,
+            topk,
+            strategy=selected_strategy
+    )
+
+    LOG.info(f"scored strategy: {scored}")
+   #  # Pass into your analyzer
+   #  selected_hybrid = analyze_and_score(
+   #      source,
+   #      stems_dir,
+   #      transcription,
+   #      topk=topk,
+   #      strategy=hybrid
+   #  )
+
+   #  LOG.info(f"ran hybrid strat: {selected_hybrid} ")
+
+   #  selected = analyze_and_score(
+   #          source,
+   #          stems_dir,
+   #          transcription,
+   #          topk=topk,
+   #          strategy=selected_hybrid
+   #  )
+
+
+
+
+    write_dir = write_chops_and_metadata(source, scored, project_dir)
 
     # NEW: save analysis + transcript for UI (minimal addition; no new args)
-    save_analysis_and_transcript(project_dir, source, transcription, selected)
+    save_analysis_and_transcript(project_dir, source, transcription, scored)
 
     LOG.info(f"Pipeline complete. Project at: {write_dir}")
-
-
