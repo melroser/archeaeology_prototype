@@ -1,9 +1,19 @@
 """
-
     Core pipeline for Archaeologist prototype.
 
 """
+import warnings
+
+# Suppress specific noisy warnings
+warnings.filterwarnings("ignore", message=".*torchaudio._backend.list_audio_backends.*")
+warnings.filterwarnings("ignore", message=".*Model was trained with.*")
+warnings.filterwarnings("ignore", message=".*Bad things might happen.*")
+
 import logging
+# Suppress PyTorch Lightning upgrade messages
+logging.getLogger("pytorch_lightning.utilities.migration").setLevel(logging.ERROR)
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+
 import subprocess
 import json
 from pathlib import Path
@@ -195,6 +205,7 @@ def save_analysis_and_transcript(project_dir: Path,
     with (project_dir / "analysis.json").open("w", encoding="utf8") as f:
         json.dump(analysis, f, ensure_ascii=False, indent=2)
 
+
 def identify_track_acoustid(filepath: Path, acoustid_key: Optional[str]) -> Tuple[str,str]:
     # First, extract info from filename as fallback
     filename_hint = filepath.stem.lower()
@@ -274,82 +285,6 @@ def identify_track_acoustid(filepath: Path, acoustid_key: Optional[str]) -> Tupl
 
     return ("Unknown Artist", filepath.stem)
 
-# def identify_track_acoustid(filepath: Path, acoustid_key: Optional[str]) -> Tuple[str,str]:
-#     if acoustid_key is None:
-#         LOG.debug("No AcoustID key; using filename as title.")
-#         return ("Unknown Artist", filepath.stem)
-#     try:
-#         cmd = ["fpcalc", "-json", str(filepath)]
-#         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf8")
-#         data = json.loads(out)
-#         fingerprint = data.get("fingerprint")
-#         duration = int(data.get("duration",0))
-#         params = {
-#             "client": acoustid_key,
-#             "fingerprint": fingerprint,
-#             "duration": duration,
-#             "meta": "recordings"
-#         }
-#         import requests
-#         r = requests.get("https://api.acoustid.org/v2/lookup", params=params, timeout=20)
-#         r.raise_for_status()
-#         res = r.json()
-#         results = res.get("results",[])
-# 
-#         # Log all results for debugging
-#         LOG.info(f"AcoustID returned {len(results)} results:")
-#         for i, result in enumerate(results[:3]):
-#             score = result.get("score", 0.0)
-#             recs = result.get("recordings", [])
-#             if recs:
-#                 title = recs[0].get("title", "Unknown")
-#                 artists = recs[0].get("artists", [])
-#                 artist = artists[0].get("name") if artists else "Unknown"
-#                 LOG.info(f"  {i+1}. {artist} - {title} (confidence: {score:.3f})")
-# 
-#         # Filter by confidence score - only accept high confidence matches
-#         high_confidence_results = [
-#             result for result in results
-#             if result.get("score", 0.0) >= 0.8  # 80% confidence threshold
-#         ]
-# 
-#         if high_confidence_results:
-#             # Use the highest confidence result
-#             best_result = max(high_confidence_results, key=lambda x: x.get("score", 0.0))
-#             recs = best_result.get("recordings",[])
-#             confidence = best_result.get("score", 0.0)
-# 
-#             if recs:
-#                 title = recs[0].get("title", filepath.stem)
-#                 artists = recs[0].get("artists",[])
-#                 artist = artists[0].get("name") if artists else "Unknown Artist"
-#                 LOG.info(f"✓ High confidence match: {artist} - {title} (confidence: {confidence:.3f})")
-#                 return (artist, title)
-# 
-#         # If no high-confidence matches, try medium confidence (60-80%)
-#         medium_confidence_results = [
-#             result for result in results
-#             if 0.6 <= result.get("score", 0.0) < 0.8
-#         ]
-# 
-#         if medium_confidence_results:
-#             best_result = max(medium_confidence_results, key=lambda x: x.get("score", 0.0))
-#             recs = best_result.get("recordings",[])
-#             confidence = best_result.get("score", 0.0)
-# 
-#             if recs:
-#                 title = recs[0].get("title", filepath.stem)
-#                 artists = recs[0].get("artists",[])
-#                 artist = artists[0].get("name") if artists else "Unknown Artist"
-#                 LOG.warning(f"⚠ Medium confidence match: {artist} - {title} (confidence: {confidence:.3f})")
-#                 return (artist, title)
-# 
-#         LOG.warning(f"No confident matches found (highest confidence: {max([r.get('score', 0.0) for r in results], default=0.0):.3f})")
-# 
-#     except Exception as e:
-#         LOG.warning(f"AcoustID lookup failed: {e}")
-# 
-#     return ("Unknown Artist", filepath.stem)
 
 
 def separate_stems_demucs(source_path: Path, stems_dir: Path) -> Optional[Path]:
@@ -409,38 +344,31 @@ def _get_device_and_compute_type():
         pass
     return "cpu", "float16"
 
-def transcribe_whisperx(source_path: Path, model_name: str = "small") -> Dict:
+
+def transcribe_whisperx(source_path: Path, model_name: str = "small") -> tuple[Dict, str]:
     """
-    Transcribe with WhisperX - force CPU for stability on Mac
+    Returns (transcription_result, model_type_used)
+    model_type_used: 'x' for WhisperX, 'o' for OpenAI Whisper
     """
     try:
         import whisperx
-        
-        # FORCE CPU - MPS is broken in WhisperX
-        device = "cpu"
+        device = "cpu"  # Force CPU as discussed
         compute_type = "float32"
         
-        LOG.info(f"Loading WhisperX model={model_name} device={device} compute_type={compute_type}")
+        LOG.info(f"Loading WhisperX model={model_name} device={device}")
         model = whisperx.load_model(model_name, device=device, compute_type=compute_type)
-        
         result = model.transcribe(str(source_path))
         
-        # Try alignment for word-level timestamps
+        # Try alignment
         try:
             align_model, metadata = whisperx.load_align_model(
-                language_code=result.get("language", "en"),
-                device=device  # Also CPU
+                language_code=result.get("language", "en"), device=device
             )
             aligned = whisperx.align(
-                result["segments"],
-                align_model,
-                metadata,
-                str(source_path),
-                device=device
+                result["segments"], align_model, metadata, str(source_path), device=device
             )
             if aligned and aligned.get("word_segments"):
                 result["segments"] = aligned["word_segments"]
-                LOG.info("✓ Got word-level timestamps from WhisperX")
             elif aligned and aligned.get("segments"):
                 result["segments"] = aligned["segments"]
         except Exception as e:
@@ -449,7 +377,7 @@ def transcribe_whisperx(source_path: Path, model_name: str = "small") -> Dict:
         return {
             "text": result.get("text", ""),
             "segments": result.get("segments", [])
-        }
+        }, 'x'  # WhisperX succeeded
         
     except Exception as e:
         LOG.warning(f"WhisperX failed: {e}; falling back to whisper.")
@@ -458,11 +386,13 @@ def transcribe_whisperx(source_path: Path, model_name: str = "small") -> Dict:
             import whisper
             model = whisper.load_model(model_name, device="cpu")
             res = model.transcribe(str(source_path), fp16=False)
-            return {"text": res.get("text", ""), "segments": res.get("segments", [])}
+            return {
+                "text": res.get("text", ""), 
+                "segments": res.get("segments", [])
+            }, 'o'  # OpenAI Whisper used
         except Exception as e2:
             LOG.error(f"All transcription failed: {e2}")
-            return {"text": "", "segments": []}
-
+            return {"text": "", "segments": []}, 'o'
 
 
 def analyze_and_score(source_path: Path,
@@ -597,7 +527,9 @@ def analyze_and_score(source_path: Path,
     LOG.info(f"Selected {len(selected)} candidate chops (mode={mode}, topk={topk})")
     return selected
 
-def write_chops_and_metadata(source_path: Path, selected: List[Dict], project_dir: Path):
+
+def write_chops_and_metadata(source_path: Path, selected: List[Dict], project_dir: Path, 
+                           strategy_name: str, model_type: str, model_size: str):
     import soundfile as sf
     import librosa
 
@@ -612,7 +544,6 @@ def write_chops_and_metadata(source_path: Path, selected: List[Dict], project_di
     chops_folder.mkdir(exist_ok=True)
 
     stems_dir = project_dir / "stems"
-    # prefer common demucs name first
     vocal_path = None
     if stems_dir.exists():
         vp = stems_dir / "vocals.wav"
@@ -626,9 +557,26 @@ def write_chops_and_metadata(source_path: Path, selected: List[Dict], project_di
     if vocal_path:
         LOG.info(f"Using vocal stem at {vocal_path}")
     else:
-        LOG.info("No vocal stem found; using full mix for chops. Consider running demucs for better vocal isolation.")
+        LOG.info("No vocal stem found; using full mix for chops.")
 
     y_full, sr = librosa.load(str(vocal_path) if vocal_path else str(source_path), sr=22050, mono=True)
+
+    # Strategy mapping
+    strategy_map = {
+        "vocal": "V", "energy": "E", "lyrical": "L", 
+        "perc": "P", "balanced": "B", "hybrid": "H"
+    }
+    
+    # Model size mapping  
+    size_map = {
+        "tiny": "T", "small": "S", "medium": "M", "large": "L"
+    }
+    
+    # Create prefix: [Strategy][ModelType][Size]
+    strat_code = strategy_map.get(strategy_name.lower(), "U")  # U for Unknown
+    model_code = model_type  # 'x' or 'o'
+    size_code = size_map.get(model_size.lower(), "S")  # Default Small
+    prefix = f"{strat_code}{model_code}{size_code}"
 
     rows = []
     for c in selected:
@@ -640,23 +588,32 @@ def write_chops_and_metadata(source_path: Path, selected: List[Dict], project_di
             continue
         chunk = y_full[st:en]
         lab = (c.get("label","") or "").strip().replace(" ", "_")[:40]
-        fname = f"{s:.3f}-{d:.3f}-{c['type']}"
+        
+        # NEW: Add prefix to filename
+        fname = f"{prefix}_{s:.3f}-{d:.3f}-{c['type']}"
         if lab:
             fname += f"-{lab}"
         score_rounded = round(c.get("score", 0.0), 3)
         fname += f"-{score_rounded:.3f}.wav"
+        
         out_path = chops_folder / fname
         sf.write(str(out_path), chunk, sr)
-        rows.append({"start": s, "dur": d, "type": c["type"], "label": c.get("label",""), "score": c.get("score",0.0), "file": str(out_path.relative_to(project_dir))})
+        rows.append({
+            "strategy": strategy_name,
+            "model": f"{model_type}{model_size}", 
+            "start": s, "dur": d, "type": c["type"], 
+            "label": c.get("label",""), "score": c.get("score",0.0), 
+            "file": str(out_path.relative_to(project_dir))
+        })
 
     csv_path = project_dir / "chops.csv"
     with open(csv_path, "w", newline="", encoding="utf8") as cf:
-        writer = csv.DictWriter(cf, fieldnames=["start","dur","type","label","score","file"])
+        writer = csv.DictWriter(cf, fieldnames=["strategy", "model", "start", "dur", "type", "label", "score", "file"])
         writer.writeheader()
         for r in rows:
             writer.writerow(r)
 
-    LOG.info(f"Wrote {len(rows)} chops to {chops_folder}; metadata at {csv_path}")
+    LOG.info(f"Wrote {len(rows)} chops ({prefix}) to {chops_folder}")
     return project_dir
 
 
@@ -705,8 +662,9 @@ def run_pipeline(
         LOG.info("Skipping stem separation due to --skip-separate flag")
         stems_dir = None if not stems_exist else stems_dir
 
-    transcription = transcribe_whisperx(source, model_name=whisper_model)
+    transcription, model_type = transcribe_whisperx(source, model_name=whisper_model)
     LOG.info("Transcription complete: %d segments", len(transcription.get("segments", [])))
+
     # Create your strategies
     selected_strategy = VocalPriorityStrategy()
     LOG.info(f"selecstrategy: {selected_strategy}")
@@ -728,39 +686,24 @@ def run_pipeline(
                 (vocal_priority, 0.6),
                 (perc_driven, 0.4)
             ])
-
+    
     scored = analyze_and_score(
-            source,
-            stems_dir,
-            transcription,
-            topk,
-            strategy=selected_strategy
+        source,
+        stems_dir,
+        transcription,
+        topk,
+        strategy=selected_strategy
     )
 
     LOG.info(f"scored strategy: {scored}")
-   #  # Pass into your analyzer
-   #  selected_hybrid = analyze_and_score(
-   #      source,
-   #      stems_dir,
-   #      transcription,
-   #      topk=topk,
-   #      strategy=hybrid
-   #  )
 
-   #  LOG.info(f"ran hybrid strat: {selected_hybrid} ")
-
-   #  selected = analyze_and_score(
-   #          source,
-   #          stems_dir,
-   #          transcription,
-   #          topk=topk,
-   #          strategy=selected_hybrid
-   #  )
-
-
-
-
-    write_dir = write_chops_and_metadata(source, scored, project_dir)
+    # NEW: Pass strategy and model info
+    write_dir = write_chops_and_metadata(
+        source, scored, project_dir, 
+        strategy_name=strat,
+        model_type=model_type,
+        model_size=whisper_model
+    )
 
     # NEW: save analysis + transcript for UI (minimal addition; no new args)
     save_analysis_and_transcript(project_dir, source, transcription, scored)
