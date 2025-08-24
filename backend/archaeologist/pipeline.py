@@ -195,36 +195,161 @@ def save_analysis_and_transcript(project_dir: Path,
     with (project_dir / "analysis.json").open("w", encoding="utf8") as f:
         json.dump(analysis, f, ensure_ascii=False, indent=2)
 
-
-
-
 def identify_track_acoustid(filepath: Path, acoustid_key: Optional[str]) -> Tuple[str,str]:
+    # First, extract info from filename as fallback
+    filename_hint = filepath.stem.lower()
+
     if acoustid_key is None:
         LOG.debug("No AcoustID key; using filename as title.")
         return ("Unknown Artist", filepath.stem)
+
     try:
         cmd = ["fpcalc", "-json", str(filepath)]
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf8")
         data = json.loads(out)
         fingerprint = data.get("fingerprint")
         duration = int(data.get("duration",0))
-        params = {"client": acoustid_key, "fingerprint": fingerprint, "duration": duration, "meta": "recordings"}
+        params = {
+                "client": acoustid_key, 
+                "fingerprint": fingerprint, 
+                "duration": duration, 
+                "meta": "recordings"
+                }
         import requests
         r = requests.get("https://api.acoustid.org/v2/lookup", params=params, timeout=20)
         r.raise_for_status()
         res = r.json()
         results = res.get("results",[])
+
+        # Log all results
+        LOG.info(f"AcoustID returned {len(results)} results:")
+        for i, result in enumerate(results[:3]):
+            score = result.get("score", 0.0)
+            recs = result.get("recordings", [])
+            if recs:
+                title = recs[0].get("title", "Unknown")
+                artists = recs[0].get("artists", [])
+                artist = artists[0].get("name") if artists else "Unknown"
+                LOG.info(f"  {i+1}. {artist} - {title} (confidence: {score:.3f})")
+
+        # Check for suspicious matches
         if results:
-            recs = results[0].get("recordings",[])
+            best_result = results[0]
+            confidence = best_result.get("score", 0.0)
+            recs = best_result.get("recordings",[])
+
             if recs:
                 title = recs[0].get("title", filepath.stem)
                 artists = recs[0].get("artists",[])
                 artist = artists[0].get("name") if artists else "Unknown Artist"
-                LOG.info(f"AcoustID: {artist} - {title}")
+
+                # Sanity check: Does this match make sense?
+                suspicious = False
+
+                # Check if result is generic like "Track 15"
+                if title.lower().startswith("track ") and title[6:].isdigit():
+                    LOG.warning(f"Suspicious generic title: {title}")
+                    suspicious = True
+
+                # Check if filename contains known artist/song info that doesn't match
+                if "deer dance" in filename_hint and "deer" not in title.lower():
+                    LOG.warning(f"Filename suggests 'Deer Dance' but got '{title}'")
+                    suspicious = True
+
+                if "system of a down" in filename_hint and "system" not in artist.lower():
+                    LOG.warning(f"Filename suggests 'System of a Down' but got '{artist}'")
+                    suspicious = True
+
+                if suspicious and confidence < 0.99:  # Even high confidence can be wrong
+                    LOG.warning(f"Suspicious match detected, using filename instead")
+                    return ("Unknown Artist", filepath.stem)
+
+                LOG.info(f"✓ Match accepted: {artist} - {title} (confidence: {confidence:.3f})")
                 return (artist, title)
+
+        LOG.warning("No valid matches found")
+
     except Exception as e:
         LOG.warning(f"AcoustID lookup failed: {e}")
+
     return ("Unknown Artist", filepath.stem)
+
+# def identify_track_acoustid(filepath: Path, acoustid_key: Optional[str]) -> Tuple[str,str]:
+#     if acoustid_key is None:
+#         LOG.debug("No AcoustID key; using filename as title.")
+#         return ("Unknown Artist", filepath.stem)
+#     try:
+#         cmd = ["fpcalc", "-json", str(filepath)]
+#         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf8")
+#         data = json.loads(out)
+#         fingerprint = data.get("fingerprint")
+#         duration = int(data.get("duration",0))
+#         params = {
+#             "client": acoustid_key,
+#             "fingerprint": fingerprint,
+#             "duration": duration,
+#             "meta": "recordings"
+#         }
+#         import requests
+#         r = requests.get("https://api.acoustid.org/v2/lookup", params=params, timeout=20)
+#         r.raise_for_status()
+#         res = r.json()
+#         results = res.get("results",[])
+# 
+#         # Log all results for debugging
+#         LOG.info(f"AcoustID returned {len(results)} results:")
+#         for i, result in enumerate(results[:3]):
+#             score = result.get("score", 0.0)
+#             recs = result.get("recordings", [])
+#             if recs:
+#                 title = recs[0].get("title", "Unknown")
+#                 artists = recs[0].get("artists", [])
+#                 artist = artists[0].get("name") if artists else "Unknown"
+#                 LOG.info(f"  {i+1}. {artist} - {title} (confidence: {score:.3f})")
+# 
+#         # Filter by confidence score - only accept high confidence matches
+#         high_confidence_results = [
+#             result for result in results
+#             if result.get("score", 0.0) >= 0.8  # 80% confidence threshold
+#         ]
+# 
+#         if high_confidence_results:
+#             # Use the highest confidence result
+#             best_result = max(high_confidence_results, key=lambda x: x.get("score", 0.0))
+#             recs = best_result.get("recordings",[])
+#             confidence = best_result.get("score", 0.0)
+# 
+#             if recs:
+#                 title = recs[0].get("title", filepath.stem)
+#                 artists = recs[0].get("artists",[])
+#                 artist = artists[0].get("name") if artists else "Unknown Artist"
+#                 LOG.info(f"✓ High confidence match: {artist} - {title} (confidence: {confidence:.3f})")
+#                 return (artist, title)
+# 
+#         # If no high-confidence matches, try medium confidence (60-80%)
+#         medium_confidence_results = [
+#             result for result in results
+#             if 0.6 <= result.get("score", 0.0) < 0.8
+#         ]
+# 
+#         if medium_confidence_results:
+#             best_result = max(medium_confidence_results, key=lambda x: x.get("score", 0.0))
+#             recs = best_result.get("recordings",[])
+#             confidence = best_result.get("score", 0.0)
+# 
+#             if recs:
+#                 title = recs[0].get("title", filepath.stem)
+#                 artists = recs[0].get("artists",[])
+#                 artist = artists[0].get("name") if artists else "Unknown Artist"
+#                 LOG.warning(f"⚠ Medium confidence match: {artist} - {title} (confidence: {confidence:.3f})")
+#                 return (artist, title)
+# 
+#         LOG.warning(f"No confident matches found (highest confidence: {max([r.get('score', 0.0) for r in results], default=0.0):.3f})")
+# 
+#     except Exception as e:
+#         LOG.warning(f"AcoustID lookup failed: {e}")
+# 
+#     return ("Unknown Artist", filepath.stem)
 
 
 def separate_stems_demucs(source_path: Path, stems_dir: Path) -> Optional[Path]:
@@ -284,40 +409,27 @@ def _get_device_and_compute_type():
         pass
     return "cpu", "float16"
 
-
 def transcribe_whisperx(source_path: Path, model_name: str = "small") -> Dict:
     """
-    Transcribe with WhisperX and perform forced alignment for word-level timestamps.
-    Forces float32 on Apple Silicon/CPU to avoid fp16 errors.
-    Falls back to whisper if whisperx not available.
+    Transcribe with WhisperX - force CPU for stability on Mac
     """
     try:
         import whisperx
+        
+        # FORCE CPU - MPS is broken in WhisperX
         device = "cpu"
-        compute_type = "float16"
-
-        # simple, robust device choice
-        try:
-            import torch
-            if torch.backends.mps.is_available():
-                device = "mps"
-                compute_type = "float16"
-            elif torch.cuda.is_available():
-                device = "cuda"
-                compute_type = "float16"  # ok on NVIDIA
-        except Exception:
-            pass
-
+        compute_type = "float32"
+        
         LOG.info(f"Loading WhisperX model={model_name} device={device} compute_type={compute_type}")
         model = whisperx.load_model(model_name, device=device, compute_type=compute_type)
-
+        
         result = model.transcribe(str(source_path))
-
-        # forced alignment for word-level timestamps
+        
+        # Try alignment for word-level timestamps
         try:
             align_model, metadata = whisperx.load_align_model(
                 language_code=result.get("language", "en"),
-                device=device
+                device=device  # Also CPU
             )
             aligned = whisperx.align(
                 result["segments"],
@@ -328,27 +440,30 @@ def transcribe_whisperx(source_path: Path, model_name: str = "small") -> Dict:
             )
             if aligned and aligned.get("word_segments"):
                 result["segments"] = aligned["word_segments"]
+                LOG.info("✓ Got word-level timestamps from WhisperX")
             elif aligned and aligned.get("segments"):
                 result["segments"] = aligned["segments"]
         except Exception as e:
-            LOG.warning(f"WhisperX alignment unavailable or failed: {e}")
-
+            LOG.warning(f"WhisperX alignment failed: {e}")
+        
         return {
             "text": result.get("text", ""),
             "segments": result.get("segments", [])
         }
-
+        
     except Exception as e:
-        LOG.warning(f"whisperx not available ({e}); falling back to whisper.")
-
+        LOG.warning(f"WhisperX failed: {e}; falling back to whisper.")
+        
         try:
-            import whisper as whisper_base
-            model = whisper_base.load_model(model_name, device="cpu")
+            import whisper
+            model = whisper.load_model(model_name, device="cpu")
             res = model.transcribe(str(source_path), fp16=False)
             return {"text": res.get("text", ""), "segments": res.get("segments", [])}
         except Exception as e2:
-            LOG.error(f"No transcription model available. Install whisperx or whisper. {e2}")
+            LOG.error(f"All transcription failed: {e2}")
             return {"text": "", "segments": []}
+
+
 
 def analyze_and_score(source_path: Path,
                       stems_dir: Optional[Path],
@@ -567,11 +682,28 @@ def run_pipeline(
     project_dir = out_base / f"{artist} - {title}"
     project_dir.mkdir(exist_ok=True)
 
-    stems_dir = None
+    stems_dir = project_dir / "stems"
 
-    if not skip_sep:
-        stems_dir = separate_stems_demucs(source, project_dir / "stems")
+    # Check if stems already exist
+    stems_exist = False
+    if stems_dir.exists() and stems_dir.is_dir():
+        # Check for common stem files
+        expected_stems = ["vocals.wav", "drums.wav", "bass.wav", "other.wav"]
+        existing_stems = [s for s in expected_stems if (stems_dir / s).exists()]
+
+        if existing_stems:
+            stems_exist = True
+            LOG.info(f"Found existing stems ({len(existing_stems)} files) in {stems_dir}")
+            LOG.info(f"Skipping stem separation - using existing stems: {existing_stems}")
+
+    # Only separate if stems don't exist and skip_sep is False
+    if not skip_sep and not stems_exist:
+        LOG.info("Stems not found, running separation...")
+        stems_dir = separate_stems_demucs(source, stems_dir)
         LOG.info(f"Separation completed. Stems at: {stems_dir}")
+    elif skip_sep:
+        LOG.info("Skipping stem separation due to --skip-separate flag")
+        stems_dir = None if not stems_exist else stems_dir
 
     transcription = transcribe_whisperx(source, model_name=whisper_model)
     LOG.info("Transcription complete: %d segments", len(transcription.get("segments", [])))
